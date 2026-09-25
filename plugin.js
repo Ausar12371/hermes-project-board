@@ -51,7 +51,9 @@ const CATS = [
   { id: 'app', name: '程序', icon: 'window', hint: '程序 · 脚本 · 服务' },
   { id: 'game', name: '游戏', icon: 'game', hint: '游戏相关的一切' },
   { id: 'project', name: '项目', icon: 'project', hint: '成体系的工程 / 交付' },
-  { id: 'chore', name: '杂活', icon: 'tools', hint: '视频超清 · 问答 · 电脑问题 · 监测检测' }
+  { id: 'chore', name: '杂活', icon: 'tools', hint: '视频超清 · 问答 · 电脑问题 · 监测检测' },
+  // manual = 「归它由人说了算」：AI 分类不碰这一类（归档 = 完事了，模型判不出来），列头带折叠开关
+  { id: 'archived', name: '归档', icon: 'archive', hint: '完成的 · 搁置的', manual: true }
 ]
 
 const CAT_BY_ID = {}
@@ -61,6 +63,9 @@ for (const c of CATS) {
   CAT_BY_ID[c.id] = c
   CAT_BY_NAME[c.name] = c
 }
+
+// 「由人手动归」的分类（归档）：AI 分类永远不碰
+const isManualCat = catId => Boolean(CAT_BY_ID[catId] && CAT_BY_ID[catId].manual)
 
 /* ============================ 小工具 ============================ */
 
@@ -433,7 +438,7 @@ const api = {
 /* ============================ AI 分类 ============================ */
 
 function promptHeader() {
-  const lines = CATS.map(c => '- ' + c.name + '：' + c.hint)
+  const lines = CATS.filter(c => !c.manual).map(c => '- ' + c.name + '：' + c.hint)
 
   return (
     '你是项目归档助手。把用户列出的每个项目归到下面唯一的分类里，只能从这些名字里挑：\n' +
@@ -465,7 +470,7 @@ function parseAssignments(text, items) {
         const idx = parseInt(k, 10) - 1
         const cat = CAT_BY_NAME[String(obj[k]).trim()]
 
-        if (items[idx] && cat) out[items[idx].id] = cat.id
+        if (items[idx] && cat && !cat.manual) out[items[idx].id] = cat.id
       }
 
       if (Object.keys(out).length) return out
@@ -481,7 +486,7 @@ function parseAssignments(text, items) {
     const idx = parseInt(m[1], 10) - 1
     const cat = CAT_BY_NAME[m[2]]
 
-    if (items[idx] && cat) out[items[idx].id] = cat.id
+    if (items[idx] && cat && !cat.manual) out[items[idx].id] = cat.id
   }
 
   return out
@@ -538,7 +543,7 @@ async function runAutoClassify(attempt) {
 
   if (!b) return
 
-  const pending = autoClassifyMode === 'all' ? b.items.slice() : b.items.filter(it => !it.cat)
+  const pending = (autoClassifyMode === 'all' ? b.items : b.items.filter(it => !it.cat)).filter(it => !isManualCat(it.cat))
 
   log('runAutoClassify attempt', attempt, '| pending', pending.length)
 
@@ -1220,6 +1225,71 @@ function Card(props) {
 function Column(props) {
   const isUnfiled = props.catId === UNFILED
   const cat = isUnfiled ? null : CAT_BY_ID[props.catId]
+  const collapsed = Boolean(props.collapsed)
+  const canCollapse = Boolean(cat && cat.manual)
+
+  if (collapsed) {
+    return el(
+      'div',
+      {
+        className: cn(
+          'flex h-full w-[46px] shrink-0 flex-col items-center gap-2 rounded-lg border p-2',
+          props.over ? 'border-(--ui-accent)' : 'border-(--ui-stroke-tertiary)',
+          'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_55%,transparent)]'
+        ),
+        onDragOver: e => {
+          e.preventDefault()
+
+          try {
+            e.dataTransfer.dropEffect = 'move'
+          } catch (err) {
+            /* noop */
+          }
+
+          props.onOver(props.catId)
+        },
+        onDragLeave: () => props.onOver(null),
+        onDrop: e => {
+          e.preventDefault()
+          props.onOver(null)
+
+          let id = ''
+
+          try {
+            id = e.dataTransfer.getData('text/plain')
+          } catch (err) {
+            id = ''
+          }
+
+          if (id) props.onDropItem(id, props.catId)
+        }
+      },
+      el(
+        'button',
+        {
+          className: ICONBTN,
+          type: 'button',
+          title: '展开「' + (isUnfiled ? '待分类' : cat.name) + '」',
+          onClick: () => props.onToggleCollapse && props.onToggleCollapse()
+        },
+        el(Codicon, { name: 'chevron-right' })
+      ),
+      el(Codicon, { name: isUnfiled ? 'inbox' : cat.icon, size: '0.8rem' }),
+      el('span', { className: 'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)' }, String(props.count)),
+      el(
+        'span',
+        { className: 'select-none text-[0.7rem] text-(--ui-text-secondary) [writing-mode:vertical-rl]' },
+        isUnfiled ? '待分类' : cat.name
+      ),
+      canCollapse
+        ? el(
+            'span',
+            { className: 'mt-auto select-none text-[0.65rem] text-(--ui-text-quaternary) [writing-mode:vertical-rl]' },
+            '拖进来就算归档'
+          )
+        : null
+    )
+  }
 
   return el(
     'div',
@@ -1278,7 +1348,14 @@ function Column(props) {
         'button',
         { className: ICONBTN, type: 'button', title: '往这一类里加新项目', onClick: () => props.onAddItem(props.catId) },
         el(Codicon, { name: 'add' })
-      )
+      ),
+      canCollapse
+        ? el(
+            'button',
+            { className: ICONBTN, type: 'button', title: '收起「' + cat.name + '」', onClick: () => props.onToggleCollapse && props.onToggleCollapse() },
+            el(Codicon, { name: 'chevron-left' })
+          )
+        : null
     ),
     el(
       'div',
@@ -1314,6 +1391,27 @@ function Page() {
   const [selMode, setSelMode] = useState(false)
   const [sel, setSel] = useState([])
   const [classifying, setClassifying] = useState(false)
+  const [archCollapsed, setArchCollapsed] = useState(() => {
+    try {
+      return Boolean(ctxRef && ctxRef.storage.get('board-v3-collapse-archived', false))
+    } catch (e) {
+      return false
+    }
+  })
+
+  const toggleArchCollapsed = () => {
+    setArchCollapsed(prev => {
+      const next = !prev
+
+      try {
+        if (ctxRef) ctxRef.storage.set('board-v3-collapse-archived', next)
+      } catch (e) {
+        /* 记不住就算了 */
+      }
+
+      return next
+    })
+  }
 
   if (!board) {
     return el('div', { className: 'p-6 text-sm text-(--ui-text-tertiary)' }, '正在读取…')
@@ -1452,6 +1550,8 @@ function Page() {
       over: over === c.id,
       items: board.items.filter(it => it.cat === c.id && hit(it)),
       busy: Boolean(busyChat),
+      collapsed: Boolean(c.manual && archCollapsed),
+      onToggleCollapse: c.manual ? toggleArchCollapsed : null,
       onOver: setOver,
       onDropItem: drop,
       onChatCat: startCategoryChat,
@@ -1490,7 +1590,7 @@ function Page() {
       onClose: () => setDlg(null),
       onAll: () => {
         setDlg(null)
-        runClassify(board.items.slice())
+        runClassify(board.items.filter(it => !isManualCat(it.cat)))
       }
     })
   } else if (dlg && dlg.type === 'deleteMany') {
