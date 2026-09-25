@@ -12,6 +12,8 @@
  *  - 标注：每张卡一个备注框（即改即存）+ 星标 + 路径（点击复制）
  *  - 点「继续处理」= 新建会话 + 把这一个项目的上下文递过去，接着干
  *  - 搜索过滤 · 实时计数 · 导出/导入 JSON · 入口：侧边栏 / Ctrl+K / 状态栏
+ *  - 自动收录：做过的会话自动收进「待分类」（启动后首拉 + 每 10 分钟一轮 + 打开页面即查；
+ *    手动删除 / 清空过的项目记入黑名单，不会被再次收录）
  *
  * 跨机器：只用网关 RPC（llm.oneshot / session.create / prompt.submit）+ 插件自己的
  * localStorage。没有本机路径、没有写死的模型名 —— 换台装了桌面端的机器，
@@ -31,7 +33,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { jsx } from 'react/jsx-runtime'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 const ID = 'project-board'
 const KEY = 'board-v3'
@@ -41,6 +43,11 @@ const FLAG_KEY = 'auto-classify-v3.1'
 const KEY_V2 = 'board-v2'
 const KEY_V1 = 'board-v1'
 const UNFILED = null
+
+// 自动收录：把做过的会话自动收进「待分类」。手动删掉的会话记进黑名单，永不复活。
+const DISMISS_KEY = 'board-v3-dismissed'
+const SESS_LIMIT = 300
+const SYNC_EVERY = 10 * 60 * 1000
 
 /* ============================ 固定分类（唯一真源） ============================ */
 
@@ -225,6 +232,161 @@ function persist(data) {
   }
 }
 
+/* ============================ 自动收录（会话 → 待分类） ============================ */
+
+function normName(s) {
+  return String(s || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+// 「项目 · 」「分类 · 」这类前缀，比对时剥掉
+function stripPrefix(s) {
+  return String(s || '').replace(/^(项目|分类)\s*·\s*/, '')
+}
+
+function readDismissed() {
+  try {
+    const v = ctxRef && ctxRef.storage.get(DISMISS_KEY, null)
+
+    return v && typeof v === 'object' ? v : {}
+  } catch (e) {
+    return {}
+  }
+}
+
+function writeDismissed(d) {
+  try {
+    if (ctxRef) ctxRef.storage.set(DISMISS_KEY, d)
+  } catch (e) {
+    /* 写不进去下次再说 */
+  }
+}
+
+function markDismissed(sids) {
+  const d = readDismissed()
+  let n = 0
+
+  for (const s of sids || []) {
+    if (s && !d[s]) {
+      d[s] = 1
+      n++
+    }
+  }
+
+  if (n) writeDismissed(d)
+}
+
+function sessionToItem(s) {
+  const title = stripPrefix(
+    String(s.title || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  )
+  const preview = String(s.preview || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  let name = title
+
+  if (!name) {
+    name = preview ? (preview.length > 26 ? preview.slice(0, 26) + '…' : preview) : '会话 ' + String(s.id || '').slice(-6)
+  }
+
+  const ms = Number(s.started_at || 0)
+  const t = ms > 1e12 ? ms : ms * 1000
+  const dt = t ? new Date(t) : null
+  const day = dt && !isNaN(dt.getTime()) ? ' · ' + (dt.getMonth() + 1) + '/' + dt.getDate() : ''
+  const note = '自动收录' + day + (s.message_count ? ' · ' + s.message_count + ' 条消息' : '')
+
+  return { id: uid('p'), name: name, path: '', note: note, cat: UNFILED, star: false, sid: s.id }
+}
+
+// 松匹配：会话名和现有项目名互相包含也算「已经在了」（避免同一项目两条卡）
+function alreadyCovered(nm, names) {
+  if (!nm || nm.length < 4) return false
+
+  for (const x of names) {
+    if (x.length >= 4 && (x.indexOf(nm) >= 0 || nm.indexOf(x) >= 0)) return true
+  }
+
+  return false
+}
+
+let syncing = false
+
+// 拉全量会话，把没收录过的丢进「待分类」。reason: boot / interval / open / manual
+async function syncSessions(reason) {
+  if (syncing) return 0
+
+  const b = $board.get()
+
+  if (!b) return 0
+
+  syncing = true
+
+  try {
+    const res = await host.request('session.list', { limit: SESS_LIMIT })
+    const list = (res && res.sessions) || []
+    const dismissed = readDismissed()
+    const haveSids = {}
+    const names = []
+
+    for (const it of b.items) {
+      if (it.sid) haveSids[it.sid] = 1
+
+      const nm = normName(it.name)
+
+      if (nm && names.indexOf(nm) < 0) names.push(nm)
+    }
+
+    const fresh = []
+
+    for (const s of list) {
+      if (!s || !s.id) continue
+      if (dismissed[s.id]) continue
+      if (haveSids[s.id]) continue
+      if (Number(s.message_count || 0) < 2) continue
+      if (/^分类\s*·/.test(String(s.title || '').trim())) continue
+
+      const cand = sessionToItem(s)
+      const nm = normName(cand.name)
+
+      if (!nm) continue
+      if (names.indexOf(nm) >= 0 || alreadyCovered(nm, names)) continue
+
+      haveSids[s.id] = 1
+      names.push(nm)
+      fresh.push(cand)
+    }
+
+    log('syncSessions(' + reason + '): sessions=' + list.length + ' | new=' + fresh.length)
+
+    if (!fresh.length) {
+      if (reason === 'manual') toast('没有新项目要收录 — 做过的都在清单里了')
+
+      return 0
+    }
+
+    withBoard(bb => {
+      for (const f of fresh) bb.items.push(f)
+
+      return bb
+    })
+    toast('自动收录 ' + fresh.length + ' 个新项目 → 待分类')
+
+    return fresh.length
+  } catch (e) {
+    log('syncSessions failed: ' + errText(e))
+
+    if (reason === 'manual') toast('收录失败：' + errText(e))
+
+    return -1
+  } finally {
+    syncing = false
+  }
+}
+
 function boot(ctx) {
   ctxRef = ctx
   autoClassifyMode = false
@@ -359,6 +521,11 @@ const api = {
     })
   },
   delItem(id) {
+    const cur = $board.get()
+    const it = cur && cur.items.find(x => x.id === id)
+
+    if (it && it.sid) markDismissed([it.sid])
+
     withBoard(b => {
       b.items = b.items.filter(x => x.id !== id)
 
@@ -367,6 +534,9 @@ const api = {
   },
   delItems(ids) {
     const n = ids.length
+    const cur = $board.get()
+
+    if (cur) markDismissed(cur.items.filter(x => ids.indexOf(x.id) >= 0 && x.sid).map(x => x.sid))
 
     withBoard(b => {
       b.items = b.items.filter(x => ids.indexOf(x.id) < 0)
@@ -422,14 +592,23 @@ const api = {
     return n
   },
   importJson(data) {
+    const cur = $board.get()
+
+    if (cur) markDismissed(cur.items.map(x => x.sid).filter(Boolean))
     commit(normalize(data))
     toast('导入完成：' + data.items.length + ' 个项目')
   },
   reset() {
+    const cur = $board.get()
+
+    if (cur) markDismissed(cur.items.map(x => x.sid).filter(Boolean))
     commit(normalize({ v: 3, cats: [], items: seedItems() }))
     toast('已恢复初始清单（等 AI 归类）')
   },
   clearAll() {
+    const cur = $board.get()
+
+    if (cur) markDismissed(cur.items.map(x => x.sid).filter(Boolean))
     commit(normalize({ v: 3, cats: [], items: [] }))
     toast('清单已清空')
   }
@@ -649,16 +828,24 @@ function Modal(props) {
     'div',
     {
       className: 'fixed inset-0 z-50 flex items-center justify-center p-6',
-      style: { background: 'color-mix(in srgb, var(--ui-bg-chrome) 72%, transparent)' },
+      style: { background: 'rgba(0, 0, 0, 0.5)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' },
       onClick: props.onClose
     },
     el(
       'div',
       {
         className: cn(
-          'flex max-h-full w-full flex-col rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) p-4 shadow-2xl',
+          'flex max-h-full w-full flex-col rounded-lg border border-(--ui-stroke-secondary) p-4 shadow-2xl',
           props.wide ? 'max-w-xl' : 'max-w-sm'
         ),
+        // 必须清晰可读：壁纸插件会把 --ui-bg-elevated 调成半透明，
+        // 所以弹窗自带双层底（种子色优先 → 桌面端变量兜底）+ 毛玻璃
+        style: {
+          background:
+            'color-mix(in srgb, var(--theme-elevated-seed, var(--ui-bg-elevated)) 92%, transparent), var(--theme-background-seed, var(--ui-bg-chrome))',
+          backdropFilter: 'blur(20px) saturate(1.1)',
+          WebkitBackdropFilter: 'blur(20px) saturate(1.1)'
+        },
         onClick: e => {
           if (e && e.stopPropagation) e.stopPropagation()
         }
@@ -1307,10 +1494,11 @@ function Column(props) {
     'div',
     {
       className: cn(
-        'flex h-full w-[250px] shrink-0 flex-col gap-2 rounded-lg border p-2',
+        'relative flex h-full shrink-0 flex-col gap-2 rounded-lg border p-2',
         props.over ? 'border-(--ui-accent)' : 'border-(--ui-stroke-tertiary)',
         'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_55%,transparent)]'
       ),
+      style: { width: String(props.width || 250) + 'px' },
       onDragOver: e => {
         e.preventDefault()
 
@@ -1372,7 +1560,7 @@ function Column(props) {
     el(
       'div',
       { className: 'truncate text-[0.625rem] text-(--ui-text-quaternary)' },
-      isUnfiled ? '还没想好放哪儿的' : cat.hint
+      isUnfiled ? '还没想好放哪儿的 · 做过的会话会自动收进来' : cat.hint
     ),
     el(
       'div',
@@ -1387,7 +1575,15 @@ function Column(props) {
             },
             isUnfiled ? '全部归好类了 🎉' : '把卡片拖到这里'
           )
-    )
+    ),
+    // 列宽拖拽手柄（像终端窗口那样拖边缘）：hover 高亮，双击恢复默认
+    el('div', {
+      className:
+        'absolute top-0 right-0 z-10 h-full w-[5px] cursor-col-resize rounded-r-lg transition-colors hover:bg-[color-mix(in_srgb,var(--ui-accent)_45%,transparent)]',
+      title: '拖我调列宽（双击恢复默认）',
+      onMouseDown: e => props.onStartResize && props.onStartResize(e, props.catId),
+      onDoubleClick: () => props.onResetWidth && props.onResetWidth(props.catId)
+    })
   )
 }
 
@@ -1403,6 +1599,13 @@ function Page() {
   const [selMode, setSelMode] = useState(false)
   const [sel, setSel] = useState([])
   const [classifying, setClassifying] = useState(false)
+  const [syncBusy, setSyncBusy] = useState(false)
+
+  // 每次打开这个页面顺手收录一次（静默：没有新项目不打扰）
+  useEffect(() => {
+    syncSessions('open')
+  }, [])
+
   const [archCollapsed, setArchCollapsed] = useState(() => {
     try {
       return Boolean(ctxRef && ctxRef.storage.get('board-v3-collapse-archived', false))
@@ -1555,6 +1758,66 @@ function Page() {
     setDlg({ type: 'aiConfirm' })
   }
 
+  const [colW, setColW] = useState(() => {
+    try {
+      const v = ctxRef && ctxRef.storage.get('board-v3-col-widths', {})
+
+      return v && typeof v === 'object' ? v : {}
+    } catch (e) {
+      return {}
+    }
+  })
+
+  const persistColW = next => {
+    try {
+      if (ctxRef) ctxRef.storage.set('board-v3-col-widths', next)
+    } catch (e) {
+      /* 记不住就算了 */
+    }
+  }
+
+  const startResize = (e, catId) => {
+    if (!e || !e.clientX) return
+
+    if (e.preventDefault) e.preventDefault()
+    if (e.stopPropagation) e.stopPropagation()
+
+    const startX = e.clientX
+    const startW = Number(colW[catId]) || 250
+    const move = ev => {
+      const w = Math.max(172, Math.min(560, Math.round(startW + (ev.clientX - startX))))
+
+      setColW(prev => Object.assign({}, prev, { [catId]: w }))
+    }
+    const up = () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('mousemove', move)
+        window.removeEventListener('mouseup', up)
+      }
+
+      setColW(prev => {
+        persistColW(prev)
+
+        return prev
+      })
+    }
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('mousemove', move)
+      window.addEventListener('mouseup', up)
+    }
+  }
+
+  const resetColW = catId =>
+    setColW(prev => {
+      const next = Object.assign({}, prev)
+
+      delete next[catId]
+      persistColW(next)
+
+      return next
+    })
+
   const cardProps = it => ({
     key: it.id,
     item: it,
@@ -1586,6 +1849,9 @@ function Page() {
       busy: Boolean(busyChat),
       collapsed: Boolean(c.manual && archCollapsed),
       onToggleCollapse: c.manual ? toggleArchCollapsed : null,
+      width: Number(colW[c.id]) || 250,
+      onStartResize: startResize,
+      onResetWidth: resetColW,
       onOver: setOver,
       onDropItem: drop,
       onChatCat: startCategoryChat,
@@ -1675,6 +1941,25 @@ function Page() {
         },
         el(Codicon, { name: classifying ? 'sync~spin' : 'sparkle' }),
         classifying ? 'AI 归类中…' : 'AI 分类'
+      ),
+      el(
+        'button',
+        {
+          className: cn(BTN, syncBusy ? BTN_ON : null),
+          type: 'button',
+          title: '把做过的会话自动收进「待分类」（手动删过的不再收）',
+          disabled: syncBusy,
+          style: syncBusy ? { opacity: 0.6 } : null,
+          onClick: () => {
+            setSyncBusy(true)
+            Promise.resolve(syncSessions('manual')).then(
+              () => setSyncBusy(false),
+              () => setSyncBusy(false)
+            )
+          }
+        },
+        el(Codicon, { name: syncBusy ? 'sync~spin' : 'inbox' }),
+        syncBusy ? '收录中…' : '收录会话'
       ),
       el(
         'button',
@@ -1849,5 +2134,10 @@ export default {
     } else {
       log('auto-classify not armed | mode=' + String(autoClassifyMode) + ' done=' + String(autoClassifyDone))
     }
+
+    // 自动收录：启动 9 秒后首拉全量会话；此后每 10 分钟查一次有没有新项目
+    setTimeout(() => syncSessions('boot'), 9000)
+    setInterval(() => syncSessions('interval'), SYNC_EVERY)
+    log('auto-collect armed (boot in 9s, every ' + Math.round(SYNC_EVERY / 60000) + 'min)')
   }
 }
