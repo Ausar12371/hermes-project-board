@@ -1130,6 +1130,18 @@ function Card(props) {
         ? null
         : el(
             'button',
+            {
+              className: cn(ICONBTN, isManualCat(it.cat) ? 'text-(--ui-accent)' : null),
+              type: 'button',
+              title: isManualCat(it.cat) ? '从归档取回（回到待分类）' : '归档（收进归档列）',
+              onClick: () => (isManualCat(it.cat) ? props.onUnarchive(it) : props.onArchive(it))
+            },
+            el(Codicon, { name: isManualCat(it.cat) ? 'reply' : 'archive' })
+          ),
+      props.selMode
+        ? null
+        : el(
+            'button',
             { className: ICONBTN, type: 'button', title: '编辑', onClick: () => props.onEdit(it) },
             el(Codicon, { name: 'edit' })
           )
@@ -1398,6 +1410,26 @@ function Page() {
       return false
     }
   })
+  const [archShown, setArchShown] = useState(() => {
+    try {
+      return Boolean(ctxRef && ctxRef.storage.get('board-v3-show-archived', false))
+    } catch (e) {
+      return false
+    }
+  })
+
+  const toggleArchShown = () =>
+    setArchShown(prev => {
+      const next = !prev
+
+      try {
+        if (ctxRef) ctxRef.storage.set('board-v3-show-archived', next)
+      } catch (e) {
+        /* 记不住就算了 */
+      }
+
+      return next
+    })
 
   const toggleArchCollapsed = () => {
     setArchCollapsed(prev => {
@@ -1537,12 +1569,14 @@ function Page() {
     onStar: x => api.updItem(x.id, { star: !x.star }),
     onEdit: x => setDlg({ type: 'item', id: x.id }),
     onAssign: x => setDlg({ type: 'assign', id: x.id }),
-    onNote: (x, v) => api.updItem(x.id, { note: v })
+    onNote: (x, v) => api.updItem(x.id, { note: v }),
+    onArchive: x => api.assign([x.id], 'archived'),
+    onUnarchive: x => api.assign([x.id], UNFILED)
   })
 
   const drop = (id, cat) => api.assign([id], cat)
 
-  const columns = CATS.map(c =>
+  const columns = CATS.filter(c => !c.manual || archShown).map(c =>
     el(Column, {
       key: c.id,
       catId: c.id,
@@ -1664,6 +1698,17 @@ function Page() {
         },
         el(Codicon, { name: 'checklist' }),
         selMode ? '退出选择' : '选择'
+      ),
+      el(
+        'button',
+        {
+          className: cn(BTN, archShown ? BTN_ON : null),
+          type: 'button',
+          title: archShown ? '收起归档列' : '显示归档列（放完成 / 搁置的项目）',
+          onClick: toggleArchShown
+        },
+        el(Codicon, { name: 'archive' }),
+        '归档 · ' + board.items.filter(it => isManualCat(it.cat)).length
       ),
       el(
         'button',
