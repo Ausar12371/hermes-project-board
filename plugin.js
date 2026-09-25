@@ -838,13 +838,9 @@ function Modal(props) {
           'flex max-h-full w-full flex-col rounded-lg border border-(--ui-stroke-secondary) p-4 shadow-2xl',
           props.wide ? 'max-w-xl' : 'max-w-sm'
         ),
-        // 必须清晰可读：壁纸插件会把 --ui-bg-elevated 调成半透明，
-        // 所以弹窗自带双层底（种子色优先 → 桌面端变量兜底）+ 毛玻璃
+        // 实心弹窗（用户要求：不用透明）——主题不透明基色优先，桌面端变量兜底
         style: {
-          background:
-            'color-mix(in srgb, var(--theme-elevated-seed, var(--ui-bg-elevated)) 92%, transparent), var(--theme-background-seed, var(--ui-bg-chrome))',
-          backdropFilter: 'blur(20px) saturate(1.1)',
-          WebkitBackdropFilter: 'blur(20px) saturate(1.1)'
+          background: 'var(--theme-elevated-seed, var(--ui-bg-elevated))'
         },
         onClick: e => {
           if (e && e.stopPropagation) e.stopPropagation()
